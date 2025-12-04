@@ -28,9 +28,6 @@ monai_demo/
 │
 └── .gitignore # 忽略 data / outputs / checkpoints 等大型資料
 
-yaml
-複製程式碼
-
 ---
 
 ## 🚀 功能說明
