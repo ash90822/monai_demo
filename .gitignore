@@ -1,0 +1,28 @@
+# Python cache
+__pycache__/
+*.pyc
+
+# VSCode
+.vscode/
+
+# Virtual env
+env/
+venv/
+.monai_env/
+
+# Large folders
+data/
+outputs/
+checkpoints/
+logs/
+
+# Random temp files
+*.npy
+*.npz
+*.pkl
+*.pth
+*.ckpt
+
+# OS 系統檔案
+.DS_Store
+Thumbs.db
