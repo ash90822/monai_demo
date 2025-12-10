@@ -4,7 +4,7 @@
 **訓練（train.py）**、**推論（infer.py）**、**Dataset 與 Transform**、**LabelMe JSON 匯出** 的模組化架構。
 
 ---
-
+```
 ## 📁 專案結構
 
 monai_demo/
@@ -26,11 +26,11 @@ monai_demo/
 │ ├── io.py # 自訂 I/O 函式（如 load_image_single）
 │ └── metrics.py # Dice / IoU 計算
 │
+├──losses/
+│ └──deep_supervision.py # deepSupervision
+│
 └── .gitignore # 忽略 data / outputs / checkpoints 等大型資料
-
-yaml
-複製程式碼
-
+```
 ---
 
 ## 🚀 功能說明
@@ -46,7 +46,7 @@ yaml
 - Resized
 
 ### ✔ 3. 多器官 UNet 分割
-- MONAI UNet backbone
+- MONAI nn-UNet backbone
 - out_channels 與類別數自動對應 config.py
 - 訓練採用 Dice Loss（softmax 版）
 
