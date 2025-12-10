@@ -1,13 +1,20 @@
-from monai.networks.nets import UNet
+from monai.networks.nets import DynUNet
 from configs.config import CFG
 
-def get_basic_unet():
-    model = UNet(
+def get_basic_nnUnet():
+    num_levels = len(CFG.model.channels)
+    kernel_size = [[3, 3] for _ in range(num_levels)]
+    strides = [[1, 1]] + [[s, s] for s in CFG.model.strides]
+    upsample_kernel_size = [[s, s] for s in CFG.model.strides]
+
+    model = DynUNet(
         spatial_dims=2,
-        in_channels=CFG.model.in_channels,   # 單通道輸入（我們回傳 (1,H,W)）
-        out_channels=CFG.model.out_channels,  # 背景 + 兩個器官
-        channels=CFG.model.channels,
-        strides=CFG.model.strides,
-        num_res_units=CFG.model.num_res_units,
+        in_channels=CFG.model.in_channels,
+        out_channels=CFG.model.out_channels,
+        kernel_size=kernel_size,
+        strides=strides,
+        upsample_kernel_size=upsample_kernel_size,
+        norm_name="instance",
+        deep_supervision=False,
     )
     return model

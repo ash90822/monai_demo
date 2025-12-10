@@ -4,12 +4,12 @@ import torch
 import pandas as pd
 from torch.utils.data import DataLoader
 from sklearn.model_selection import train_test_split
-
-from monai.losses import DiceLoss
-
+from monai.losses import DiceCELoss
+from losses.deep_supervision import DeepSupervisionLossWrapper
 from datasets.basic_dataset import ChestCTDataset
 from transforms.basic_transforms import get_transforms
 from configs.config import CFG
+from models.basic_unet import get_basic_nnUnet
 
 
 NUM_CLASSES = CFG.classes.num_classes
@@ -111,15 +111,25 @@ def train(csv_path: str | None = None, epochs = CFG.train.epochs):
     device = "cuda" if torch.cuda.is_available() else "cpu"
     print("Device =", device)
 
-    from models.basic_unet import get_basic_unet
-    model = get_basic_unet().to(device)
+    
+    model = get_basic_nnUnet().to(device)
 
-    loss_fn = DiceLoss(
-        to_onehot_y=True,
-        softmax=True,
-        include_background=True,
+    base_loss = DiceCELoss(
+    include_background=True,
+    to_onehot_y=True,
+    softmax=True,
     )
-    optimizer = torch.optim.Adam(model.parameters(), lr=CFG.train.lr)
+
+    loss_fn = DeepSupervisionLossWrapper(base_loss)
+
+
+    # 假設 DynUNet 回傳的是 list[Tensor] 或 (B, K, C, H, W)，這邊會自動幫你展開加權
+
+    optimizer = torch.optim.AdamW(
+        model.parameters(), 
+        lr=CFG.train.lr,
+        weight_decay=CFG.train.weight_decay
+    )
     ckpt_path = CFG.paths.checkpoint
     os.makedirs(os.path.dirname(ckpt_path), exist_ok=True)
 

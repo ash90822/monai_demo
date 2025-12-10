@@ -65,6 +65,7 @@ class TrainConfig:
     patience: int = 20
     min_delta: float = 1e-4
     num_workers: int = 0  # DataLoader workers
+    weight_decay: float = 1e-2
 
 
 # ------------ 推論相關設定 ------------
