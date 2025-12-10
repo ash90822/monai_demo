@@ -4,7 +4,7 @@
 **訓練（train.py）**、**推論（infer.py）**、**Dataset 與 Transform**、**LabelMe JSON 匯出** 的模組化架構。
 
 ---
-'''
+```
 ## 📁 專案結構
 
 monai_demo/
@@ -27,7 +27,7 @@ monai_demo/
 │ └── metrics.py # Dice / IoU 計算
 │
 └── .gitignore # 忽略 data / outputs / checkpoints 等大型資料
-'''
+```
 ---
 
 ## 🚀 功能說明
