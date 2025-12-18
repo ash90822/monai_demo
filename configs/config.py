@@ -6,8 +6,8 @@ from typing import Tuple, List, Dict
 # ------------ 路徑相關 ------------
 @dataclass
 class PathsConfig:
-    train_csv: str = "./data/train.csv"
-    test_csv: str = "./data/test.csv"
+    train_path: str = "./data/train/"
+    test_path: str = "./data/test/"
     checkpoint: str = "./checkpoints/best.pth"
     output_dir: str = "./outputs"
 

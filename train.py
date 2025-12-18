@@ -18,25 +18,15 @@ LABEL_NAMES = CFG.classes.label_names
 
 # ---------- metrics: per-class Dice ----------
 
-def compute_per_class_dice(logits, masks, num_classes=NUM_CLASSES):
-    """
-    logits: (B,C,H,W)
-    masks:  (B,1,H,W) 或 (B,H,W)，整數 label (0..C-1)
-    回傳:
-        mean_dice: float
-        dice_per_class: (C,) tensor
-    """
+def compute_per_class_dice(logits, masks, num_classes=NUM_CLASSES, exclude_background=True):
     if logits.shape[1] == 1 and num_classes == 2:
         probs_fg = torch.sigmoid(logits)
         pred_label = (probs_fg > 0.5).long().squeeze(1)
     else:
         probs = torch.softmax(logits, dim=1)
-        pred_label = probs.argmax(dim=1)  # (B,H,W)
+        pred_label = probs.argmax(dim=1)
 
-    if masks.ndim == 4:
-        gt = masks.squeeze(1).long()
-    else:
-        gt = masks.long()
+    gt = masks.squeeze(1).long() if masks.ndim == 4 else masks.long()
 
     eps = 1e-6
     dice_numer = torch.zeros(num_classes, dtype=torch.float32, device=logits.device)
@@ -53,11 +43,18 @@ def compute_per_class_dice(logits, masks, num_classes=NUM_CLASSES):
         dice_denom[c] += union + eps
 
     dice_per_class = dice_numer / dice_denom
-    mean_dice = dice_per_class.mean().item()
+
+    # ✅ 排除 bg（class 0）來算 mean
+    if exclude_background and num_classes > 1:
+        mean_dice = dice_per_class[1:].mean().item()
+    else:
+        mean_dice = dice_per_class.mean().item()
+
     return mean_dice, dice_per_class
 
 
-def evaluate(model, val_loader, device, num_classes=NUM_CLASSES):
+
+def evaluate(model, val_loader, device, num_classes=NUM_CLASSES, exclude_background=True):
     model.eval()
     dice_sum = torch.zeros(num_classes, dtype=torch.float32, device=device)
     dice_cnt = torch.zeros(num_classes, dtype=torch.float32, device=device)
@@ -68,23 +65,40 @@ def evaluate(model, val_loader, device, num_classes=NUM_CLASSES):
             img, mask = img.to(device), mask.to(device)
 
             logits = model(img)
-            _, dice_per_class = compute_per_class_dice(logits, mask, num_classes)
+
+            _, dice_per_class = compute_per_class_dice(
+                logits, mask, num_classes=num_classes, exclude_background=exclude_background
+            )
 
             dice_sum += dice_per_class
             dice_cnt += torch.ones_like(dice_per_class)
 
     dice_mean = dice_sum / (dice_cnt + eps)
-    mean_dice = dice_mean.mean().item()
+
+    # ✅ mean 也排除 bg
+    if exclude_background and num_classes > 1:
+        mean_dice = dice_mean[1:].mean().item()
+    else:
+        mean_dice = dice_mean.mean().item()
+
     return mean_dice, dice_mean
+
 
 
 # ---------- 訓練主程式 ----------
 
-def train(csv_path: str | None = None, epochs = CFG.train.epochs):
+def train(train_path: str | None = None, epochs = CFG.train.epochs):
     # 1. 讀資料 & 切 train/val
-    if csv_path is None:
-        csv_path = CFG.paths.train_csv
-    df = pd.read_csv(csv_path)
+    if train_path is None:
+        train_path = CFG.paths.train_path
+    train_img_dir = os.path.join(train_path, "images")
+    train_label_dir = os.path.join(train_path, "labels")
+    train_img_dir_list = os.listdir(train_img_dir)
+
+    df = pd.DataFrame({
+        "dcm_path": [os.path.join(train_img_dir, f) for f in train_img_dir_list],
+        "json_path": [os.path.join(train_label_dir, f.replace('.dcm', '.json')) for f in train_img_dir_list],
+    })
     train_df, val_df = train_test_split(df, test_size=0.2, random_state=42)
 
     # 2. 建立 transforms
@@ -139,7 +153,7 @@ def train(csv_path: str | None = None, epochs = CFG.train.epochs):
 
     # 5. training loop + early stopping
     for epoch in range(1, epochs + 1):
-        print(f"\n=== Epoch {epoch}/{epochs} ===")
+        print(f"\n=== Epoch {epoch}/{epochs} ===", flush=True)
         model.train()
         running_loss = 0.0
 
@@ -156,13 +170,13 @@ def train(csv_path: str | None = None, epochs = CFG.train.epochs):
             running_loss += loss.item()
 
         avg_train_loss = running_loss / max(1, len(train_loader))
-        print(f"Train loss: {avg_train_loss:.4f}")
+        print(f"Train loss: {avg_train_loss:.4f}", flush=True)
 
         # ----- Validation -----
         val_mean_dice, val_dice_per_class = evaluate(model, val_loader, device, NUM_CLASSES)
-        print(f"Val mean Dice: {val_mean_dice:.4f}")
-        for c, d in enumerate(val_dice_per_class.tolist()):
-            print(f"  - {LABEL_NAMES[c]}: Dice = {d:.4f}")
+        print(f"Val mean Dice (no bg): {val_mean_dice:.4f}", flush=True)
+        for c in range(1, NUM_CLASSES):
+            print(f"  - {LABEL_NAMES[c]}: Dice = {val_dice_per_class[c].item():.4f}", flush=True)
 
         # ----- Early Stopping -----
         if val_mean_dice > best_val_dice + CFG.train.min_delta:
@@ -170,24 +184,24 @@ def train(csv_path: str | None = None, epochs = CFG.train.epochs):
             best_epoch = epoch
             no_improve_epochs = 0
             torch.save(model.state_dict(), ckpt_path)
-            print(f"  → New best model saved (epoch {epoch}, Dice={best_val_dice:.4f})")
+            print(f"  → New best model saved (epoch {epoch}, Dice={best_val_dice:.4f})", flush=True)
         else:
             no_improve_epochs += 1
-            print(f"  No improvement for {no_improve_epochs} epoch(s).")
+            print(f"  No improvement for {no_improve_epochs} epoch(s).", flush=True)
 
         if no_improve_epochs >= CFG.train.patience:
-            print(f"\nEarly stopping at epoch {epoch}. Best epoch = {best_epoch}, Dice={best_val_dice:.4f}")
+            print(f"\nEarly stopping at epoch {epoch}. Best epoch = {best_epoch}, Dice={best_val_dice:.4f}", flush=True)
             break
 
     # 6. 訓練結束後，用 best model 再算一次完整 per-class Dice
-    print("\nLoading best model and computing final per-class Dice on validation set...")
+    print("\nLoading best model and computing final per-class Dice on validation set...", flush=True)
     model.load_state_dict(torch.load(ckpt_path, map_location=device))
     model.to(device)
 
     final_mean_dice, final_dice_per_class = evaluate(model, val_loader, device, NUM_CLASSES)
-    print(f"Final Val mean Dice: {final_mean_dice:.4f}")
-    for c, d in enumerate(final_dice_per_class.tolist()):
-        print(f"  - {LABEL_NAMES[c]}: Dice = {d:.4f}")
+    print(f"Final Val mean Dice (no bg): {final_mean_dice:.4f}", flush=True)
+    for c in range(1, NUM_CLASSES):
+        print(f"  - {LABEL_NAMES[c]}: Dice = {final_dice_per_class[c].item():.4f}", flush=True)
 
 
 if __name__ == "__main__":
