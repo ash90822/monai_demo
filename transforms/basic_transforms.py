@@ -91,7 +91,7 @@ class HETransformd(MapTransform):
         return d
 
 
-def get_transforms(img_size=None):
+def get_transforms(img_size=None, he_params=None):
     """
     回傳 train_trans, val_trans：
 
@@ -111,59 +111,46 @@ def get_transforms(img_size=None):
     if img_size is None:
         img_size = CFG.data.img_size
 
-    he_params = dict(
-        pmin=CFG.data.pmin,
-        pmax=CFG.data.pmax,
-        use_body_mask=CFG.data.use_body_mask,
-        body_hu_thresh=CFG.data.body_hu_thresh,
-    )
+    # ✅ A方案：外部傳入 he_params 優先；否則才用 CFG
+    if he_params is None:
+        he_params = dict(
+            pmin=CFG.data.pmin,
+            pmax=CFG.data.pmax,
+            use_body_mask=CFG.data.use_body_mask,
+            body_hu_thresh=CFG.data.body_hu_thresh,
+        )
+    else:
+        # 防呆：缺值就 fallback CFG
+        he_params = dict(
+            pmin=float(he_params.get("pmin", CFG.data.pmin)),
+            pmax=float(he_params.get("pmax", CFG.data.pmax)),
+            use_body_mask=bool(he_params.get("use_body_mask", CFG.data.use_body_mask)),
+            body_hu_thresh=float(he_params.get("body_hu_thresh", CFG.data.body_hu_thresh)),
+        )
 
-    # 將角度轉成 rad：
-    # imgaug: rotate=(-45,45)  degrees → (-π/4, π/4)
     rotate_min = -45.0 * np.pi / 180.0
     rotate_max = 45.0 * np.pi / 180.0
-
-    # imgaug: shear=(-16,16) degrees → 約 (-0.28, 0.28) rad
     shear_min = -16.0 * np.pi / 180.0
     shear_max = 16.0 * np.pi / 180.0
 
     train_trans = Compose([
-        # 1. HU -> HE (0~1)
         HETransformd(keys=("image",), **he_params),
-
-        # 2. resize 到固定大小（和你原本 imgaug 的作法一致：先 resize 再增強）
         Resized(
             keys=("image", "mask"),
             spatial_size=(img_size, img_size),
             mode=("bilinear", "nearest"),
         ),
-
-        # 3. 垂直翻轉（對應 imgaug.Flipud(0.5)）
-        RandFlipd(
-            keys=("image", "mask"),
-            spatial_axis=0,   # 0 = up-down
-            prob=0.5,
-        ),
-
-        # 4. 水平翻轉（對應 imgaug.Fliplr(0.5)）
-        RandFlipd(
-            keys=("image", "mask"),
-            spatial_axis=1,   # 1 = left-right
-            prob=0.5,
-        ),
-
-        # 5. Affine：rotate + shear + scale（不做平移）
+        RandFlipd(keys=("image", "mask"), spatial_axis=0, prob=0.5),
+        RandFlipd(keys=("image", "mask"), spatial_axis=1, prob=0.5),
         RandAffined(
             keys=("image", "mask"),
-            prob=1.0,  # 原本 imgaug.Affine 是一定會做，只是參數隨機
-            rotate_range=(rotate_min, rotate_max),  # 約 (-45°, 45°)
-            shear_range=(shear_min, shear_max),     # 約 (-16°, 16°)
-            scale_range=(0.8, 1.2),                 # x,y 皆在 0.8~1.2
+            prob=1.0,
+            rotate_range=(rotate_min, rotate_max),
+            shear_range=(shear_min, shear_max),
+            scale_range=(0.8, 1.2),
             mode=("bilinear", "nearest"),
             padding_mode="border",
         ),
-
-        # 6. 轉成 Torch Tensor / MetaTensor
         EnsureTyped(keys=("image", "mask")),
     ])
 

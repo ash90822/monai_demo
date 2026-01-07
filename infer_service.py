@@ -77,16 +77,31 @@ def dicom_to_hu(path: str) -> np.ndarray:
     return hu.astype(np.float32)
 
 
-def model_inference_to_label_map(model, dcm_path: str, device: str = "cpu"):
+def model_inference_to_label_map(
+    model,
+    dcm_path: str,
+    device: str = "cpu",
+    he_params: Optional[Dict[str, Any]] = None,
+):
     hu = dicom_to_hu(dcm_path)
     orig_h, orig_w = hu.shape
 
-    he_params = dict(
-        pmin=CFG.data.pmin,
-        pmax=CFG.data.pmax,
-        use_body_mask=CFG.data.use_body_mask,
-        body_hu_thresh=CFG.data.body_hu_thresh,
-    )
+    # ✅ A方案：優先用外部傳進來的 he_params，沒有才 fallback CFG
+    if he_params is None:
+        he_params = dict(
+            pmin=CFG.data.pmin,
+            pmax=CFG.data.pmax,
+            use_body_mask=CFG.data.use_body_mask,
+            body_hu_thresh=CFG.data.body_hu_thresh,
+        )
+    else:
+        # 可選：避免傳入缺 key
+        he_params = {
+            "pmin": float(he_params.get("pmin", CFG.data.pmin)),
+            "pmax": float(he_params.get("pmax", CFG.data.pmax)),
+            "use_body_mask": bool(he_params.get("use_body_mask", CFG.data.use_body_mask)),
+            "body_hu_thresh": float(he_params.get("body_hu_thresh", CFG.data.body_hu_thresh)),
+        }
 
     infer_trans = Compose([
         HETransformd(keys=("image",), **he_params),
@@ -178,7 +193,7 @@ class ModelService:
         self.model = model
         self.is_loaded = True
 
-    def predict_to_labelme(self, dcm_path: str, output_dir: Optional[str] = None) -> Dict[str, Any]:
+    def predict_to_labelme(self, dcm_path: str, output_dir: Optional[str] = None, he_params: Optional[dict] = None):
         if not self.is_loaded or self.model is None:
             raise RuntimeError("Model not loaded.")
 
@@ -186,7 +201,7 @@ class ModelService:
         out_dir.mkdir(parents=True, exist_ok=True)
 
         label_map, image_np, orig_h, orig_w = model_inference_to_label_map(
-            self.model, dcm_path, device=self.device
+        self.model, dcm_path, device=self.device, he_params=he_params   # ✅加這個
         )
 
         json_dict = label_map_to_labelme_json(

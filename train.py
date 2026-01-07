@@ -2,6 +2,7 @@
 import os
 import torch
 import pandas as pd
+from typing import Optional, Dict, Any
 from torch.utils.data import DataLoader
 from sklearn.model_selection import train_test_split
 from monai.losses import DiceCELoss
@@ -87,7 +88,7 @@ def evaluate(model, val_loader, device, num_classes=NUM_CLASSES, exclude_backgro
 
 # ---------- 訓練主程式 ----------
 
-def train(train_path: str | None = None, epochs = CFG.train.epochs):
+def train(train_path: str | None = None, epochs=CFG.train.epochs, he_params: Optional[Dict[str, Any]] = None):
     # 1. 讀資料 & 切 train/val
     if train_path is None:
         train_path = CFG.paths.train_path
@@ -102,7 +103,7 @@ def train(train_path: str | None = None, epochs = CFG.train.epochs):
     train_df, val_df = train_test_split(df, test_size=0.2, random_state=42)
 
     # 2. 建立 transforms
-    train_trans, val_trans = get_transforms()
+    train_trans, val_trans = get_transforms(he_params=he_params)
 
     # 3. 建立 Dataset / DataLoader
     train_ds = ChestCTDataset(train_df, transforms=train_trans)
@@ -205,4 +206,32 @@ def train(train_path: str | None = None, epochs = CFG.train.epochs):
 
 
 if __name__ == "__main__":
-    train()
+    import argparse
+
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--train_path", type=str, default=None)
+    parser.add_argument("--epochs", type=int, default=CFG.train.epochs)
+
+    # ✅ A方案：從 GUI 傳入 HE 參數
+    parser.add_argument("--pmin", type=float, default=None)
+    parser.add_argument("--pmax", type=float, default=None)
+    parser.add_argument("--use_body_mask", type=int, default=None)  # 1/0
+    parser.add_argument("--body_hu_thresh", type=float, default=None)
+
+    args = parser.parse_args()
+
+    he_params = None
+    # 只要有任一個被指定，就組成 he_params（其餘缺的 fallback CFG 在 get_transforms 會補）
+    if (args.pmin is not None) or (args.pmax is not None) or (args.use_body_mask is not None) or (args.body_hu_thresh is not None):
+        he_params = {}
+        if args.pmin is not None:
+            he_params["pmin"] = args.pmin
+        if args.pmax is not None:
+            he_params["pmax"] = args.pmax
+        if args.use_body_mask is not None:
+            he_params["use_body_mask"] = bool(args.use_body_mask)
+        if args.body_hu_thresh is not None:
+            he_params["body_hu_thresh"] = args.body_hu_thresh
+
+    train(train_path=args.train_path, epochs=args.epochs, he_params=he_params)
+

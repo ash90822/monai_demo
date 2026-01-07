@@ -3,6 +3,7 @@ import time
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Optional, Dict, Any, List
+from transforms.basic_transforms import HETransformd
 
 import numpy as np
 
@@ -16,6 +17,7 @@ from PyQt6.QtWidgets import (
 )
 
 from infer_service import ModelService, dicom_to_hu
+from HU_calculation import compute_hu_stats_from_labelme
 from configs.config import CFG
 
 
@@ -25,95 +27,135 @@ class Sample:
     label: Optional[int] = None
     meta: Dict[str, Any] = None
 
-
-class InferenceWorker(QThread):
-    progress = pyqtSignal(int, int)
-    message = pyqtSignal(str)
-    result = pyqtSignal(dict)
-    finished_ok = pyqtSignal()
-    failed = pyqtSignal(str)
-
-    def __init__(self, model_service: ModelService, samples: List[Sample], output_dir: str):
-        super().__init__()
-        self.model_service = model_service
-        self.samples = samples
-        self.output_dir = output_dir
-        self._stop = False
-
-    def stop(self):
-        self._stop = True
-
-    def run(self):
-        try:
-            total = len(self.samples)
-            if total == 0:
-                self.message.emit("No samples to run.")
-                self.finished_ok.emit()
-                return
-
-            self.message.emit(f"Start inference: {total} DICOM files")
-            for i, s in enumerate(self.samples, start=1):
-                if self._stop:
-                    self.message.emit("Inference stopped by user.")
-                    break
-                out = self.model_service.predict_to_labelme(str(s.image_path), output_dir=self.output_dir)
-                self.result.emit(out)
-                self.progress.emit(i, total)
-
-            self.message.emit("Inference done.")
-            self.finished_ok.emit()
-
-        except Exception as e:
-            self.failed.emit(str(e))
-
-
 class PreviewPanel(QWidget):
     def __init__(self, parent=None):
         super().__init__(parent)
 
         self._img = None  # HU float32 (H,W)
+
+        # ----- Original (WL) -----
         self._wl_enabled = True
         self._window = 400.0
         self._level = 40.0
 
-        self.image_label = QLabel("No image loaded")
-        self.image_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
-        self.image_label.setMinimumSize(480, 480)
-        self.image_label.setStyleSheet("QLabel { background: #111; color: #ddd; }")
+        # ----- HE params (editable in UI) -----
+        self._he_pmin = 1.0
+        self._he_pmax = 99.0
+        self._he_use_body_mask = True
+        self._he_body_hu_thresh = -300.0
 
-        controls = QGroupBox("Preview Controls")
-        grid = QGridLayout()
+        # ======= Image views (two panels) =======
+        self.title_orig = QLabel("Original")
+        self.title_orig.setAlignment(Qt.AlignmentFlag.AlignCenter)
+
+        self.title_he = QLabel("HE (after HETransformd)")
+        self.title_he.setAlignment(Qt.AlignmentFlag.AlignCenter)
+
+        self.label_orig = QLabel("No image loaded")
+        self.label_orig.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        self.label_orig.setMinimumSize(480, 480)
+        self.label_orig.setStyleSheet("QLabel { background: #111; color: #ddd; }")
+
+        self.label_he = QLabel("No image loaded")
+        self.label_he.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        self.label_he.setMinimumSize(480, 480)
+        self.label_he.setStyleSheet("QLabel { background: #111; color: #ddd; }")
+
+        # 左：Original title + image
+        orig_box = QVBoxLayout()
+        orig_box.addWidget(self.title_orig)
+        orig_box.addWidget(self.label_orig, stretch=1)
+
+        # 右：HE title + image
+        he_box = QVBoxLayout()
+        he_box.addWidget(self.title_he)
+        he_box.addWidget(self.label_he, stretch=1)
+
+        img_row = QHBoxLayout()
+        img_row.addLayout(orig_box, stretch=1)
+        img_row.addLayout(he_box, stretch=1)
+
+        # ======= Controls: Original =======
+        orig_controls = QGroupBox("Original Controls")
+        g1 = QGridLayout()
 
         self.chk_wl = QCheckBox("Enable Window/Level")
         self.chk_wl.setChecked(True)
-        self.chk_wl.stateChanged.connect(self._on_wl_toggle)
+        self.chk_wl.stateChanged.connect(self._on_any_change)
 
         self.win_spin = QDoubleSpinBox()
         self.win_spin.setRange(1.0, 10000.0)
         self.win_spin.setValue(self._window)
-        self.win_spin.valueChanged.connect(self._on_wl_change)
+        self.win_spin.valueChanged.connect(self._on_any_change)
 
         self.lev_spin = QDoubleSpinBox()
         self.lev_spin.setRange(-5000.0, 5000.0)
         self.lev_spin.setValue(self._level)
-        self.lev_spin.valueChanged.connect(self._on_wl_change)
+        self.lev_spin.valueChanged.connect(self._on_any_change)
 
-        grid.addWidget(self.chk_wl, 0, 0, 1, 2)
-        grid.addWidget(QLabel("Window"), 1, 0)
-        grid.addWidget(self.win_spin, 1, 1)
-        grid.addWidget(QLabel("Level"), 2, 0)
-        grid.addWidget(self.lev_spin, 2, 1)
-        controls.setLayout(grid)
+        g1.addWidget(self.chk_wl, 0, 0, 1, 2)
+        g1.addWidget(QLabel("Window"), 1, 0)
+        g1.addWidget(self.win_spin, 1, 1)
+        g1.addWidget(QLabel("Level"), 2, 0)
+        g1.addWidget(self.lev_spin, 2, 1)
+        orig_controls.setLayout(g1)
 
+        # ======= Controls: HE =======
+        he_controls = QGroupBox("HE Controls")
+        g2 = QGridLayout()
+
+        self.pmin_spin = QDoubleSpinBox()
+        self.pmin_spin.setRange(0.0, 49.9)
+        self.pmin_spin.setDecimals(1)
+        self.pmin_spin.setValue(self._he_pmin)
+        self.pmin_spin.valueChanged.connect(self._on_any_change)
+
+        self.pmax_spin = QDoubleSpinBox()
+        self.pmax_spin.setRange(50.0, 100.0)
+        self.pmax_spin.setDecimals(1)
+        self.pmax_spin.setValue(self._he_pmax)
+        self.pmax_spin.valueChanged.connect(self._on_any_change)
+
+        self.chk_body = QCheckBox("use_body_mask")
+        self.chk_body.setChecked(True)
+        self.chk_body.stateChanged.connect(self._on_any_change)
+
+        self.body_thresh_spin = QDoubleSpinBox()
+        self.body_thresh_spin.setRange(-2000.0, 2000.0)
+        self.body_thresh_spin.setDecimals(1)
+        self.body_thresh_spin.setValue(self._he_body_hu_thresh)
+        self.body_thresh_spin.valueChanged.connect(self._on_any_change)
+
+        g2.addWidget(QLabel("pmin"), 0, 0)
+        g2.addWidget(self.pmin_spin, 0, 1)
+        g2.addWidget(QLabel("pmax"), 1, 0)
+        g2.addWidget(self.pmax_spin, 1, 1)
+        g2.addWidget(self.chk_body, 2, 0, 1, 2)
+        g2.addWidget(QLabel("body_hu_thresh"), 3, 0)
+        g2.addWidget(self.body_thresh_spin, 3, 1)
+        he_controls.setLayout(g2)
+
+        # ======= Main layout =======
         layout = QVBoxLayout()
-        layout.addWidget(self.image_label, stretch=1)
-        layout.addWidget(controls)
+        layout.addLayout(img_row, stretch=1)
+        layout.addWidget(orig_controls)
+        layout.addWidget(he_controls)
         self.setLayout(layout)
+
+    # ---- A方案：讓外部（推論/訓練）取得目前GUI的HE參數 ----
+    def get_he_params(self) -> dict:
+        return dict(
+            pmin=float(self.pmin_spin.value()),
+            pmax=float(self.pmax_spin.value()),
+            use_body_mask=bool(self.chk_body.isChecked()),
+            body_hu_thresh=float(self.body_thresh_spin.value()),
+        )
 
     def load_dicom(self, path: Path):
         hu = dicom_to_hu(str(path))
         self._img = hu
 
+        # WL 預設：CFG.infer 優先，否則 robust
         if CFG.infer.window_center is not None and CFG.infer.window_width is not None:
             self._level = float(CFG.infer.window_center)
             self._window = float(CFG.infer.window_width)
@@ -141,7 +183,18 @@ class PreviewPanel(QWidget):
         x = (x - low) / max(1e-6, (high - low))
         return (x * 255.0).astype(np.uint8)
 
-    def _on_wl_toggle(self):
+    @staticmethod
+    def _to_pixmap(img8: np.ndarray, target_label: QLabel) -> QPixmap:
+        h, w = img8.shape
+        qimg = QImage(img8.data, w, h, w, QImage.Format.Format_Grayscale8)
+        pix = QPixmap.fromImage(qimg)
+        return pix.scaled(
+            target_label.size(),
+            Qt.AspectRatioMode.KeepAspectRatio,
+            Qt.TransformationMode.SmoothTransformation
+        )
+
+    def _on_any_change(self):
         self._wl_enabled = self.chk_wl.isChecked()
         self._refresh_view()
 
@@ -152,35 +205,41 @@ class PreviewPanel(QWidget):
 
     def _refresh_view(self):
         if self._img is None:
-            self.image_label.setText("No image loaded")
+            self.label_orig.setText("No image loaded")
+            self.label_he.setText("No image loaded")
             return
 
+        # -------- Original view --------
         if self._wl_enabled:
-            img8 = self._apply_window_level(self._img, self._window, self._level)
+            orig8 = self._apply_window_level(self._img, self._window, self._level)
         else:
             vmin, vmax = float(np.nanmin(self._img)), float(np.nanmax(self._img))
             denom = max(1e-6, vmax - vmin)
-            img8 = np.clip((self._img - vmin) / denom * 255.0, 0, 255).astype(np.uint8)
+            orig8 = np.clip((self._img - vmin) / denom * 255.0, 0, 255).astype(np.uint8)
 
-        h, w = img8.shape
-        qimg = QImage(img8.data, w, h, w, QImage.Format.Format_Grayscale8)
-        pix = QPixmap.fromImage(qimg)
-        pix = pix.scaled(
-            self.image_label.size(),
-            Qt.AspectRatioMode.KeepAspectRatio,
-            Qt.TransformationMode.SmoothTransformation
-        )
-        self.image_label.setPixmap(pix)
+        self.label_orig.setPixmap(self._to_pixmap(orig8, self.label_orig))
+
+        # -------- HE view (using your HETransformd) --------
+        he_params = self.get_he_params()
+        he_t = HETransformd(keys=("image",), **he_params)
+
+        # HETransformd expects (1,H,W) or (H,W); it outputs (1,H,W) in 0~1
+        out = he_t({"image": self._img[np.newaxis, ...]})
+        he01 = out["image"][0]
+        he8 = (np.clip(he01, 0.0, 1.0) * 255.0).astype(np.uint8)
+
+        self.label_he.setPixmap(self._to_pixmap(he8, self.label_he))
 
     def resizeEvent(self, event):
         super().resizeEvent(event)
         self._refresh_view()
 
 
+
 class MainWindow(QMainWindow):
     def __init__(self):
         super().__init__()
-        self.setWindowTitle("DICOM Inference GUI (PyQt6)")
+        self.setWindowTitle("Medical_ImageSeg(MONAI+PyQt6)")
         self.resize(1200, 720)
 
         self.model_service = ModelService()
@@ -197,33 +256,32 @@ class MainWindow(QMainWindow):
         btn_row = QHBoxLayout()
         self.btn_select_folder = QPushButton("Select Folder (DICOM)")
         self.btn_select_folder.clicked.connect(self.on_select_folder)
-
         self.btn_select_output = QPushButton("Select Output Dir")
         self.btn_select_output.clicked.connect(self.on_select_output_dir)
+        self.btn_hu = QPushButton("Compute HU CSV")
+        self.btn_hu.clicked.connect(self.on_compute_hu)
 
-        self.btn_load_model = QPushButton("Load Model")
-        self.btn_load_model.clicked.connect(self.on_load_model)
-
-        # ---- Training controls ----
-        self.train_img_dir = ""
-        self.train_label_dir = ""
+        
+        # ---- Training controls (single root) ----
+        self.train_root_dir = ""
 
         train_row = QHBoxLayout()
-        self.btn_pick_train_img = QPushButton("Train Images Dir")
-        self.btn_pick_train_lbl = QPushButton("Train Labels Dir")
+        self.btn_pick_train_root = QPushButton("Select Train Root")
+        self.btn_pick_train_root.clicked.connect(self.on_pick_train_root_dir)
         self.btn_start_train = QPushButton("Start Train")
         self.btn_start_train.clicked.connect(self.on_start_train)
+        self.btn_load_model = QPushButton("Load Model")
+        self.btn_load_model.clicked.connect(self.on_load_model)
+        
 
-        self.btn_pick_train_img.clicked.connect(self.on_pick_train_img_dir)
-        self.btn_pick_train_lbl.clicked.connect(self.on_pick_train_label_dir)
-
-        train_row.addWidget(self.btn_pick_train_img)
-        train_row.addWidget(self.btn_pick_train_lbl)
+        train_row.addWidget(self.btn_pick_train_root)
         train_row.addWidget(self.btn_start_train)
+        train_row.addWidget(self.btn_load_model)
 
         btn_row.addWidget(self.btn_select_folder)
         btn_row.addWidget(self.btn_select_output)
-        btn_row.addWidget(self.btn_load_model)
+        btn_row.addWidget(self.btn_hu)
+        
 
         left_layout.addLayout(train_row)
 
@@ -232,10 +290,10 @@ class MainWindow(QMainWindow):
         self.case_list.setSelectionMode(QAbstractItemView.SelectionMode.ExtendedSelection)
 
         infer_row = QHBoxLayout()
-        self.btn_run_selected = QPushButton("Run Selected")
+        self.btn_run_selected = QPushButton("Inference Selected")
         self.btn_run_selected.clicked.connect(self.on_run_selected)
 
-        self.btn_run_all = QPushButton("Run All")
+        self.btn_run_all = QPushButton("Inference All")
         self.btn_run_all.clicked.connect(self.on_run_all)
 
         self.btn_stop = QPushButton("Stop")
@@ -245,6 +303,7 @@ class MainWindow(QMainWindow):
         infer_row.addWidget(self.btn_run_selected)
         infer_row.addWidget(self.btn_run_all)
         infer_row.addWidget(self.btn_stop)
+        
 
         self.progress = QProgressBar()
         self.progress.setValue(0)
@@ -278,6 +337,29 @@ class MainWindow(QMainWindow):
 
         self._log(f"Ready. Device={self.model_service.device}")
 
+    def _set_busy(self, busy: bool):
+        self.btn_stop.setEnabled(busy)
+        self.btn_run_all.setEnabled(not busy)
+        self.btn_run_selected.setEnabled(not busy)
+        self.btn_start_train.setEnabled(not busy)
+        if hasattr(self, "btn_hu"):
+            self.btn_hu.setEnabled(not busy)
+
+    def on_stop(self):
+        self._log("[STOP] Requested.")
+
+        # 1) 停推理
+        if hasattr(self, "worker") and self.worker and self.worker.isRunning():
+            self.worker.stop()
+
+        # 2) 停訓練（真的 kill）
+        if hasattr(self, "train_worker") and self.train_worker and self.train_worker.isRunning():
+            self.train_worker.stop()
+
+        # 3) 停 HU
+        if hasattr(self, "hu_worker") and self.hu_worker and self.hu_worker.isRunning():
+            self.hu_worker.stop()
+
     def _log(self, msg: str):
         t = time.strftime("%H:%M:%S")
         self.log.append(f"[{t}] {msg}")
@@ -301,7 +383,7 @@ class MainWindow(QMainWindow):
         if not folder:
             return
         folder = Path(folder)
-
+        self.selected_dicom_dir = str(folder)
         self.samples = self._scan_folder(folder)
         self._log(f"Selected: {folder}")
         self._log(f"Found {len(self.samples)} DICOM files.")
@@ -309,6 +391,26 @@ class MainWindow(QMainWindow):
 
         if self.samples:
             self.case_list.setCurrentRow(0)
+
+    def on_pick_train_root_dir(self):
+        d = QFileDialog.getExistingDirectory(self, "Select training root directory (must contain images/ and labels/)")
+        if not d:
+            return
+        self.train_root_dir = d
+
+        root = Path(d)
+        img_dir = root / "images"
+        lbl_dir = root / "labels"
+
+        if not img_dir.is_dir() or not lbl_dir.is_dir():
+            QMessageBox.warning(self, "Invalid structure", "Selected folder must contain subfolders: images/ and labels/")
+            self._log(f"[TRAIN] Invalid root: {d} (missing images/ or labels/)")
+            self.train_root_dir = ""
+            return
+
+        self._log(f"[TRAIN] root_dir = {d}")
+        self._log(f"[TRAIN] images_dir = {img_dir}")
+        self._log(f"[TRAIN] labels_dir = {lbl_dir}")
 
     def on_select_output_dir(self):
         out = QFileDialog.getExistingDirectory(self, "Select output directory for LabelMe JSON")
@@ -353,7 +455,36 @@ class MainWindow(QMainWindow):
         except Exception as e:
             QMessageBox.critical(self, "Load Model Failed", str(e))
 
+    def on_compute_hu(self):
+        if not getattr(self, "selected_dicom_dir", ""):
+            QMessageBox.information(self, "Missing", "Please Select Folder (DICOM) first.")
+            return
+
+        mask_dir = self.output_dir  # 你推論 json 存放位置
+        self._log(f"[HU] Start. dicom_dir={self.selected_dicom_dir}, mask_dir={mask_dir}")
+
+        self.hu_worker = HUCalcWorker(self.selected_dicom_dir, mask_dir)
+        self.hu_worker.message.connect(self._log)
+        self.hu_worker.progress.connect(self.on_progress)
+        self.hu_worker.finished_ok.connect(self._on_hu_finished)
+        self.hu_worker.failed.connect(self._on_hu_failed)
+
+        self._set_busy(True)
+        self.hu_worker.start()
+
+    def _on_hu_finished(self, csv_path: str):
+        self._log(f"[HU] Done. csv={csv_path}")
+        self._set_busy(False)
+
+    def _on_hu_failed(self, err: str):
+        self._log(f"[HU] Failed: {err}")
+        self._set_busy(False)
+
+
     def _start_worker(self, samples: List[Sample]):
+        he_params = self.preview.get_he_params()
+        self._log(f"[HE] Using params: {he_params}")   # 只 log，不用顯示在GUI
+
         if self.worker is not None and self.worker.isRunning():
             QMessageBox.warning(self, "Busy", "Inference is already running.")
             return
@@ -366,7 +497,12 @@ class MainWindow(QMainWindow):
         self.btn_run_all.setEnabled(False)
         self.btn_run_selected.setEnabled(False)
 
-        self.worker = InferenceWorker(self.model_service, samples, output_dir=self.output_dir)
+        self.worker = InferenceWorker(
+        self.model_service,
+        samples,
+        output_dir=self.output_dir,
+        he_params=he_params,   # ✅加這個
+        )
         self.worker.message.connect(self._log)
         self.worker.progress.connect(self.on_progress)
         self.worker.result.connect(self.on_result)
@@ -406,32 +542,45 @@ class MainWindow(QMainWindow):
         self._log(f"[TRAIN] labels_dir = {d}")
 
     def on_start_train(self):
-        if not self.train_img_dir or not self.train_label_dir:
-            QMessageBox.information(self, "Missing", "Please select both training images dir and labels dir.")
+        if not self.train_root_dir:
+            QMessageBox.information(self, "Missing", "Please select Train Root first.")
             return
 
-        pairs, missing_labels, missing_images = validate_pairs(self.train_img_dir, self.train_label_dir)
+        root = Path(self.train_root_dir)
+        img_dir = str(root / "images")
+        lbl_dir = str(root / "labels")
 
-        self._log(f"Pair check: matched={len(pairs)}, missing_labels={len(missing_labels)}, missing_images={len(missing_images)}")
+        pairs, missing_labels, missing_images = validate_pairs(img_dir, lbl_dir)
+
+        self._log(f"[TRAIN] Pair check: matched={len(pairs)}, missing_labels={len(missing_labels)}, missing_images={len(missing_images)}")
         if missing_labels[:5]:
-            self._log("Missing labels examples: " + ", ".join(missing_labels[:5]))
+            self._log("[TRAIN] Missing labels examples: " + ", ".join(missing_labels[:5]))
         if missing_images[:5]:
-            self._log("Missing images examples: " + ", ".join(missing_images[:5]))
+            self._log("[TRAIN] Missing images examples: " + ", ".join(missing_images[:5]))
 
         if len(pairs) == 0:
-            QMessageBox.warning(self, "Invalid", "No matched image/label pairs. Check filenames and extensions.")
+            QMessageBox.warning(self, "Invalid", "No matched image/label pairs.")
             return
         if missing_labels or missing_images:
             # 你要嚴格就直接 return；或允許部分對齊訓練
             QMessageBox.warning(self, "Not aligned", "Some files are not aligned. Check log for details.")
             return
 
-        # 背景訓練
-        self._log("Start training worker...")
-        self.train_worker = TrainWorker(self.train_img_dir, self.train_label_dir)
+        self._log("[TRAIN] Start training worker...")
+        hp = self.preview.get_he_params()
+        extra_args = [
+            "--pmin", str(hp["pmin"]),
+            "--pmax", str(hp["pmax"]),
+            "--use_body_mask", "1" if hp["use_body_mask"] else "0",
+            "--body_hu_thresh", str(hp["body_hu_thresh"]),
+        ]
+        self.train_worker = TrainWorker(
+            train_root_dir=self.train_root_dir,
+            extra_args=extra_args
+        )
         self.train_worker.message.connect(self._log)
-        self.train_worker.finished_ok.connect(lambda rc: self._log(f"Train finished. return_code={rc}"))
-        self.train_worker.failed.connect(lambda e: self._log(f"Train failed: {e}"))
+        self.train_worker.finished_ok.connect(lambda rc: self._log(f"[TRAIN] Finished. return_code={rc}"))
+        self.train_worker.failed.connect(lambda e: self._log(f"[TRAIN] Failed: {e}"))
         self.train_worker.start()
 
 
@@ -465,23 +614,28 @@ class TrainWorker(QThread):
     finished_ok = pyqtSignal(int)   # return code
     failed = pyqtSignal(str)
 
-    def __init__(self, img_dir: str, label_dir: str, extra_args: Optional[List[str]] = None):
+    def __init__(self, train_root_dir: str, extra_args = None):
         super().__init__()
-        self.img_dir = img_dir
-        self.label_dir = label_dir
+        self.train_root_dir = train_root_dir
         self.extra_args = extra_args or []
+        self.proc = None
+
+    def stop(self):
+        # 像 Ctrl+C：先 terminate，不行再 kill
+        if self.proc is None:
+            return
+        try:
+            self.message.emit("[TRAIN] Terminating process...")
+            self.proc.terminate()
+        except Exception:
+            pass
 
     def run(self):
         try:
-            cmd = [
-                sys.executable, "-u", "train.py",   # <- 關鍵：-u
-                "--img_dir", self.img_dir,
-                "--label_dir", self.label_dir,
-                *self.extra_args
-            ]
+            cmd = [sys.executable, "-u", "train.py", "--train_path", self.train_root_dir, *self.extra_args]
             self.message.emit("[TRAIN] " + " ".join(cmd))
 
-            p = subprocess.Popen(
+            self.proc = subprocess.Popen(
                 cmd,
                 stdout=subprocess.PIPE,
                 stderr=subprocess.STDOUT,
@@ -490,17 +644,19 @@ class TrainWorker(QThread):
                 universal_newlines=True
             )
 
-            assert p.stdout is not None
-            for line in iter(p.stdout.readline, ""):
-                if line == "" and p.poll() is not None:
+            assert self.proc.stdout is not None
+            for line in iter(self.proc.stdout.readline, ""):
+                if line == "" and self.proc.poll() is not None:
                     break
                 self.message.emit(line.rstrip("\n"))
 
-            rc = p.wait()
+            rc = self.proc.wait()
             self.finished_ok.emit(rc)
 
         except Exception as e:
             self.failed.emit(str(e))
+        finally:
+            self.proc = None
 
 def validate_pairs(img_dir: str, label_dir: str,
                    img_exts=(".png", ".jpg", ".jpeg", ".dcm"),
@@ -530,6 +686,91 @@ def validate_pairs(img_dir: str, label_dir: str,
 
         pairs = [(img_map[k], lbl_map[k]) for k in matched]
         return pairs, missing_labels, missing_images
+
+class InferenceWorker(QThread):
+    progress = pyqtSignal(int, int)
+    message = pyqtSignal(str)
+    result = pyqtSignal(dict)
+    finished_ok = pyqtSignal()
+    failed = pyqtSignal(str)
+
+    def __init__(self, model_service, samples, output_dir: str, he_params: Optional[dict] = None):
+        super().__init__()
+        self.model_service = model_service
+        self.samples = samples
+        self.output_dir = output_dir
+        self.he_params = he_params
+        self._stop = False
+
+    def stop(self):
+        self._stop = True
+
+    def run(self):
+        try:
+            total = len(self.samples)
+            if total == 0:
+                self.message.emit("No samples to run.")
+                self.finished_ok.emit()
+                return
+
+            self.message.emit(f"Start inference: {total} DICOM files")
+            for i, s in enumerate(self.samples, start=1):
+                if self._stop:
+                    self.message.emit("Inference stopped by user.")
+                    break
+                out = self.model_service.predict_to_labelme(
+                    str(s.image_path),
+                    output_dir=self.output_dir,
+                    he_params=self.he_params,   # ✅加這個
+                )
+                self.result.emit(out)
+                self.progress.emit(i, total)
+
+            self.message.emit("Inference done.")
+            self.finished_ok.emit()
+
+        except Exception as e:
+            self.failed.emit(str(e))
+
+class HUCalcWorker(QThread):
+    progress = pyqtSignal(int, int)
+    message = pyqtSignal(str)
+    finished_ok = pyqtSignal(str)  # csv path
+    failed = pyqtSignal(str)
+
+    def __init__(self, dicom_dir: str, mask_dir: str):
+        super().__init__()
+        self.dicom_dir = dicom_dir
+        self.mask_dir = mask_dir
+        self._stop = False
+
+    def stop(self):
+        self._stop = True
+
+    def run(self):
+        try:
+            def stop_flag():
+                return self._stop
+
+            def log_cb(msg: str):
+                self.message.emit(msg)
+
+            def progress_cb(i: int, total: int):
+                self.progress.emit(i, total)
+
+            res = compute_hu_stats_from_labelme(
+                dicom_dir=self.dicom_dir,
+                mask_dir=self.mask_dir,
+                out_csv_name="hu_stats.csv",
+                stop_flag=stop_flag,
+                progress_cb=progress_cb,
+                log_cb=log_cb
+            )
+            self.finished_ok.emit(str(res.csv_path))
+
+        except Exception as e:
+            self.failed.emit(str(e))
+
 
 def main():
     app = QApplication([])
